@@ -153,7 +153,7 @@ def parse_flight_request(description: str) -> dict:
 
     # Airport codes
     airports = re.findall(r'\b([A-Z]{3})\b', desc)
-    origin = airports[0] if len(airports) > 0 else "SFO"
+    origin = airports[0] if len(airports) > 0 else "LHR"
     destination = airports[1] if len(airports) > 1 else "JFK"
 
     # Date — look for month + day
@@ -179,23 +179,35 @@ def parse_flight_request(description: str) -> dict:
     return {"origin": origin, "destination": destination, "date": date, "budget": budget}
 
 
-async def search_flights(origin: str, destination: str, date: str) -> list[dict]:
-    """Search flights via Duffel API. Returns list of offers sorted by price."""
+async def search_flights(origin: str, destination: str, date: str, passenger: dict | None = None) -> tuple[list[dict], str]:
+    """Search flights via Duffel API. Returns (offers sorted by price, passenger_id)."""
+    passenger_payload = {
+        "type": "adult",
+        "title": passenger.get("title", "mr") if passenger else "mr",
+        "gender": passenger.get("gender", "m") if passenger else "m",
+        "given_name": passenger.get("given_name", "Jaz") if passenger else "Jaz",
+        "family_name": passenger.get("family_name", "Jamal") if passenger else "Jamal",
+        "born_on": passenger.get("born_on", "1990-01-01") if passenger else "1990-01-01",
+        "email": passenger.get("email", "jaz@switchboard.ai") if passenger else "jaz@switchboard.ai",
+        "phone_number": passenger.get("phone_number", "+14155550001") if passenger else "+14155550001",
+    }
     async with httpx.AsyncClient(timeout=30) as client:
-        # Create offer request
+        # Create offer request WITH passenger details
         r = await client.post(
             f"{DUFFEL_BASE}/air/offer_requests",
             headers=DUFFEL_HEADERS,
             json={
                 "data": {
                     "slices": [{"origin": origin, "destination": destination, "departure_date": date}],
-                    "passengers": [{"type": "adult"}],
+                    "passengers": [passenger_payload],
                     "cabin_class": "economy",
                 }
             }
         )
         r.raise_for_status()
-        request_id = r.json()["data"]["id"]
+        data = r.json()["data"]
+        request_id = data["id"]
+        passenger_id = data["passengers"][0]["id"]
 
         # Get offers
         r2 = await client.get(
@@ -203,12 +215,12 @@ async def search_flights(origin: str, destination: str, date: str) -> list[dict]
             headers=DUFFEL_HEADERS,
         )
         r2.raise_for_status()
-        return r2.json()["data"]
+        return r2.json()["data"], passenger_id
 
 
-async def book_flight(offer_id: str, passenger: dict) -> dict:
+async def book_flight(offer_id: str, passenger_id: str, passenger: dict, offer_amount: str = "0", offer_currency: str = "USD") -> dict:
     """Book a flight offer. Returns order details."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"{DUFFEL_BASE}/air/orders",
             headers=DUFFEL_HEADERS,
@@ -216,11 +228,22 @@ async def book_flight(offer_id: str, passenger: dict) -> dict:
                 "data": {
                     "type": "instant",
                     "selected_offers": [offer_id],
-                    "passengers": [passenger],
-                    "payments": [{"type": "balance", "currency": "USD", "amount": "0"}],
+                    "passengers": [{
+                        "id": passenger_id,
+                        "title": passenger.get("title", "mr"),
+                        "gender": passenger.get("gender", "m"),
+                        "given_name": passenger.get("given_name", "Jaz"),
+                        "family_name": passenger.get("family_name", "Jamal"),
+                        "born_on": passenger.get("born_on", "1990-01-01"),
+                        "email": passenger.get("email", "jaz@switchboard.ai"),
+                        "phone_number": passenger.get("phone_number", "+14155550001"),
+                    }],
+                    "payments": [{"type": "balance", "currency": offer_currency, "amount": offer_amount}],
                 }
             }
         )
+        if r.status_code != 200:
+            print(f"[DUFFEL] Booking error: {r.text}")
         r.raise_for_status()
         return r.json()["data"]
 
@@ -247,8 +270,19 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         params = parse_flight_request(description)
         print(f"[TASK {task_id[:8]}] Parsed: {params}")
 
-        # Search flights
-        offers = await search_flights(params["origin"], params["destination"], params["date"])
+        # Default passenger profile (replace with user profile lookup later)
+        passenger = {
+            "title": "mr", "gender": "m",
+            "given_name": "Jaz", "family_name": "Jamal",
+            "born_on": "1990-01-01",
+            "email": "jaz@switchboard.ai",
+            "phone_number": "+14155550001",
+        }
+
+        # Search flights (passenger attached to offer request)
+        offers, passenger_id = await search_flights(
+            params["origin"], params["destination"], params["date"], passenger
+        )
 
         if not offers:
             tasks[task_id]["status"] = {"state": "failed"}
@@ -256,13 +290,18 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
             await report_to_switchboard(spend_token, 0, "No flights found")
             return
 
-        # Pick cheapest within budget
+        # In sandbox: prefer Duffel Airways (only test airline that supports booking)
+        # In live mode: pick cheapest within budget
+        duffel_offers = [o for o in offers if "duffel" in o["owner"]["name"].lower()]
         cheapest = None
-        for offer in offers:
-            price = float(offer["total_amount"])
-            if price <= params["budget"]:
-                cheapest = offer
-                break
+        if duffel_offers:
+            cheapest = duffel_offers[0]  # Duffel Airways in sandbox
+        else:
+            for offer in offers:
+                price = float(offer["total_amount"])
+                if price <= params["budget"]:
+                    cheapest = offer
+                    break
 
         if not cheapest:
             cheapest = offers[0]  # take cheapest even if over budget
@@ -275,18 +314,11 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         flight_num = slices[0]["segments"][0]["operating_carrier_flight_number"]
 
         # Book the flight (sandbox — no real charge)
-        passenger = {
-            "id": cheapest["passengers"][0]["id"],
-            "title": "mr",
-            "gender": "m",
-            "given_name": "Jaz",
-            "family_name": "Jamal",
-            "born_on": "1990-01-01",
-            "email": "jaz@switchboard.ai",
-            "phone_number": "+14155550001",
-        }
-
-        order = await book_flight(cheapest["id"], passenger)
+        order = await book_flight(
+            cheapest["id"], passenger_id, passenger,
+            offer_amount=cheapest["total_amount"],
+            offer_currency=cheapest["total_currency"],
+        )
         booking_ref = order.get("booking_reference", "DEMO01")
 
         result_text = (
