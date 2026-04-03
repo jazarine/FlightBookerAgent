@@ -41,7 +41,16 @@ DUFFEL_HEADERS     = {
 tasks: dict[str, dict] = {}
 
 
-# ── Health ─────────────────────────────────────────────────────────────────
+# ── Root + Health ────────────────────────────────────────────────────────────
+
+
+@app.get("/")
+async def root():
+    return {
+        "agent": "FlightBookerAgent",
+        "status": "ok",
+        "endpoints": ["/health", "/a2a", "/task", "/.well-known/agent.json"],
+    }
 
 
 @app.get("/health")
