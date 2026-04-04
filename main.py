@@ -84,7 +84,11 @@ async def a2a(request: Request, background_tasks: BackgroundTasks):
                 text += part.get("text", "")
 
         # Parse spend token from metadata
-        spend_token = params.get("spend_token") or task.get("metadata", {}).get("spend_token")
+        spend_token = (
+            params.get("spend_token")
+            or params.get("metadata", {}).get("spend_token")
+            or task.get("metadata", {}).get("spend_token")
+        )
 
         tasks[task_id] = {
             "id": task_id,
