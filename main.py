@@ -154,6 +154,58 @@ async def get_task(task_id: str):
 # ── Flight booking logic ──────────────────────────────────────────────────
 
 
+def parse_seat_preference(description: str) -> str:
+    """
+    Parse seat preference from task description.
+    Returns: 'window' | 'aisle' | 'middle' | 'extra_legroom' | 'any'
+    """
+    desc = description.lower()
+    if any(w in desc for w in ['extra legroom', 'legroom', 'exit row', 'bulkhead']):
+        return 'extra_legroom'
+    if 'window' in desc:
+        return 'window'
+    if 'aisle' in desc:
+        return 'aisle'
+    if 'middle' in desc:
+        return 'middle'
+    return 'any'
+
+
+def pick_seat(available_seats: list[dict], preference: str) -> dict | None:
+    """
+    Pick best seat from available list based on preference.
+    Window seats: A or F columns. Aisle: C or D. Middle: B or E.
+    Extra legroom: cheapest available (usually front rows).
+    """
+    if not available_seats:
+        return None
+
+    # Sort by price ascending
+    seats = sorted(available_seats, key=lambda s: float(s['price']))
+
+    if preference == 'extra_legroom':
+        # Front seats or exit rows tend to be pricier — pick lowest row number
+        def row_num(s):
+            try:
+                return int(''.join(c for c in s['designator'] if c.isdigit()))
+            except Exception:
+                return 999
+        return sorted(available_seats, key=row_num)[0]
+
+    col_map = {
+        'window': ['A', 'F', 'K'],
+        'aisle':  ['C', 'D', 'G', 'H'],
+        'middle': ['B', 'E'],
+    }
+    cols = col_map.get(preference, [])
+    if cols:
+        preferred = [s for s in seats if s['designator'] and s['designator'][-1] in cols]
+        if preferred:
+            return preferred[0]
+
+    return seats[0]  # fallback: cheapest available
+
+
 def parse_flight_request(description: str) -> dict:
     """
     Parse natural language flight request into structured params.
@@ -231,7 +283,36 @@ async def search_flights(origin: str, destination: str, date: str, passenger: di
         return r2.json()["data"], passenger_id
 
 
-async def book_flight(offer_id: str, passenger_id: str, passenger: dict, offer_amount: str = "0", offer_currency: str = "USD") -> dict:
+async def fetch_seat_map(offer_id: str) -> list[dict]:
+    """Fetch available seats for an offer. Returns flat list of seat dicts."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{DUFFEL_BASE}/air/seat_maps?offer_id={offer_id}",
+            headers=DUFFEL_HEADERS,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json().get('data', [])
+        if not data:
+            return []
+        available = []
+        for cabin in data[0].get('cabins', []):
+            for row in cabin.get('rows', []):
+                for section in row.get('sections', []):
+                    for el in section.get('elements', []):
+                        if el.get('type') == 'seat' and el.get('available_services'):
+                            svc = el['available_services'][0]
+                            available.append({
+                                'designator': el['designator'],
+                                'service_id': svc['id'],
+                                'passenger_id': svc.get('passenger_id'),
+                                'price': svc.get('total_amount', '0'),
+                                'currency': svc.get('total_currency', 'USD'),
+                            })
+        return available
+
+
+async def book_flight(offer_id: str, passenger_id: str, passenger: dict, offer_amount: str = "0", offer_currency: str = "USD", seat_service_id: str | None = None) -> dict:
     """Book a flight offer. Returns order details."""
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
@@ -251,6 +332,7 @@ async def book_flight(offer_id: str, passenger_id: str, passenger: dict, offer_a
                         "email": passenger.get("email", "jaz@switchboard.ai"),
                         "phone_number": passenger.get("phone_number", "+14155550001"),
                     }],
+                    "services": ([{"id": seat_service_id, "quantity": 1}] if seat_service_id else []),
                     "payments": [{"type": "balance", "currency": offer_currency, "amount": offer_amount}],
                 }
             }
@@ -326,27 +408,45 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         arrival = slices[0]["segments"][-1]["arriving_at"]
         flight_num = slices[0]["segments"][0]["operating_carrier_flight_number"]
 
+        # Seat selection
+        seat_preference = parse_seat_preference(description)
+        available_seats = await fetch_seat_map(cheapest["id"])
+        chosen_seat = pick_seat(available_seats, seat_preference)
+        seat_service_id = chosen_seat["service_id"] if chosen_seat else None
+        seat_designator = chosen_seat["designator"] if chosen_seat else None
+        seat_price = float(chosen_seat["price"]) if chosen_seat else 0.0
+        print(f"[TASK {task_id[:8]}] Seat preference={seat_preference} chosen={seat_designator} price=+${seat_price}")
+
+        # Update total with seat fee
+        total_amount = str(round(price + seat_price, 2))
+
         # Book the flight (sandbox — no real charge)
         order = await book_flight(
             cheapest["id"], passenger_id, passenger,
-            offer_amount=cheapest["total_amount"],
+            offer_amount=total_amount,
             offer_currency=cheapest["total_currency"],
+            seat_service_id=seat_service_id,
         )
         booking_ref = order.get("booking_reference", "DEMO01")
 
+        seat_line = f"   Seat: {seat_designator} (+${seat_price:.2f})" if seat_designator else "   Seat: not assigned"
         result_text = (
             f"✅ Booked: {airline} flight {flight_num}\n"
             f"   {params['origin']} → {params['destination']}\n"
             f"   Departure: {departure}\n"
             f"   Arrival: {arrival}\n"
             f"   Fare: ${price:.2f}\n"
+            f"{seat_line}\n"
+            f"   Total: ${float(total_amount):.2f}\n"
             f"   Booking ref: {booking_ref}"
         )
 
         tasks[task_id].update({
             "status": {"state": "completed"},
             "result": result_text,
-            "actual_spend": price,
+            "actual_spend": float(total_amount),
+            "seat": seat_designator,
+            "seat_price": seat_price,
             "booking_reference": booking_ref,
             "airline": airline,
             "flight_number": flight_num,
