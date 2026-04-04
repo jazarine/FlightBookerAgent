@@ -412,6 +412,94 @@ async def poll_for_input(spend_token: str, timeout_minutes: int = 30) -> Optiona
     return None
 
 
+async def fetch_passenger_profile(spend_token_id: str) -> dict:
+    """Fetch traveler profile from Switchboard wallet using the spend_token.
+    Falls back to demo passenger if not found."""
+    default = {
+        "title": "mr", "gender": "m",
+        "given_name": "Jaz", "family_name": "Jamal",
+        "born_on": "1990-01-01",
+        "email": "jaz@switchboard.ai",
+        "phone_number": "+14155550001",
+    }
+    if not spend_token_id or not SWITCHBOARD_URL:
+        return default
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Get token details to find wallet_user_id
+            r = await client.get(f"{SWITCHBOARD_URL}/tasks/{spend_token_id}")
+            if r.status_code != 200:
+                return default
+            token_data = r.json()
+            user_id = token_data.get("wallet_user_id")
+            if not user_id:
+                return default
+
+            # Fetch traveler profile
+            r2 = await client.get(
+                f"{SWITCHBOARD_URL}/wallet/users/{user_id}/profile",
+                params={"type": "traveler", "spend_token": spend_token_id},
+                headers={"Authorization": f"Bearer {AGENT_API_KEY}"},
+            )
+            if r2.status_code != 200 or not r2.json().get("data"):
+                return default
+
+            p = r2.json()["data"]
+            print(f"[PROFILE] Loaded traveler profile for user {user_id}: {p.get('full_name')}")
+
+            # Map Switchboard profile → Duffel passenger fields
+            full_name = p.get("full_name", "Jaz Jamal").split(" ", 1)
+            return {
+                "title": p.get("title", "mr"),
+                "gender": p.get("gender", "m"),
+                "given_name": full_name[0],
+                "family_name": full_name[1] if len(full_name) > 1 else "User",
+                "born_on": p.get("dob", "1990-01-01"),
+                "email": p.get("email", "user@switchboard.ai"),
+                "phone_number": p.get("phone", "+14155550001"),
+            }
+    except Exception as e:
+        print(f"[PROFILE] fetch failed: {e}")
+        return default
+
+
+async def charge_via_switchboard(spend_token_id: str, amount: float, description: str) -> bool:
+    """Charge the user's saved card via Switchboard wallet.
+    Returns True on success, False if not configured or failed."""
+    if not spend_token_id or not SWITCHBOARD_URL or not AGENT_API_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Get wallet_user_id from token
+            r = await client.get(f"{SWITCHBOARD_URL}/tasks/{spend_token_id}")
+            if r.status_code != 200:
+                return False
+            user_id = r.json().get("wallet_user_id")
+            if not user_id:
+                print(f"[CHARGE] No wallet_user_id on token {spend_token_id[:8]} — skipping wallet charge")
+                return False
+
+            r2 = await client.post(
+                f"{SWITCHBOARD_URL}/wallet/users/{user_id}/charge",
+                headers={"Authorization": f"Bearer {AGENT_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "amount": amount,
+                    "description": description,
+                    "spend_token": spend_token_id,
+                    "idempotency_key": f"flight-{spend_token_id}",
+                },
+            )
+            if r2.status_code == 200:
+                tx = r2.json()
+                print(f"[CHARGE] ✅ Charged ${amount} — tx {tx.get('transaction_id','?')[:8]} status={tx.get('status')}")
+                return True
+            print(f"[CHARGE] failed: {r2.status_code} {r2.text[:100]}")
+            return False
+    except Exception as e:
+        print(f"[CHARGE] error: {e}")
+        return False
+
+
 async def run_flight_booking(task_id: str, description: str, spend_token: Optional[str]):
     """Main booking flow with human-in-the-loop seat selection + confirmation."""
     print(f"[TASK {task_id[:8]}] Starting: {description}")
@@ -420,13 +508,9 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         params = parse_flight_request(description)
         print(f"[TASK {task_id[:8]}] Parsed: {params}")
 
-        passenger = {
-            "title": "mr", "gender": "m",
-            "given_name": "Jaz", "family_name": "Jamal",
-            "born_on": "1990-01-01",
-            "email": "jaz@switchboard.ai",
-            "phone_number": "+14155550001",
-        }
+        # Load passenger from Switchboard wallet profile (falls back to demo data)
+        passenger = await fetch_passenger_profile(spend_token)
+        print(f"[TASK {task_id[:8]}] Passenger: {passenger['given_name']} {passenger['family_name']}")
 
         # ── Step 1: Search ─────────────────────────────────────────────────
         offers, passenger_id = await search_flights(
@@ -580,7 +664,17 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         })
 
         print(f"[TASK {task_id[:8]}] {result_text}")
-        await report_to_switchboard(spend_token, total_amount, result_text)
+
+        # Charge user's wallet via Switchboard (if wallet_user_id set on token)
+        charged = await charge_via_switchboard(
+            spend_token, total_amount,
+            f"{airline} {flight_num} {params['origin']}→{params['destination']} seat {seat_designator or 'any'} ref {booking_ref}"
+        )
+        if charged:
+            print(f"[TASK {task_id[:8]}] Wallet charged via Switchboard — /complete will be called by charge endpoint")
+        else:
+            # No wallet — fall back to normal /complete
+            await report_to_switchboard(spend_token, total_amount, result_text)
 
     except Exception as e:
         import traceback
