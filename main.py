@@ -362,34 +362,53 @@ async def pause_for_input(
     input_prompt: str,
     input_schema: dict,
     timeout_minutes: int = 30,
-) -> None:
-    """Tell Switchboard this task is paused waiting for user input."""
-    if not spend_token or not AGENT_API_KEY:
-        return
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(
-            f"{SWITCHBOARD_URL}/tasks/{spend_token}/pause",
-            headers={"Authorization": f"Bearer {AGENT_API_KEY}", "Content-Type": "application/json"},
-            json={"token": spend_token, "input_prompt": input_prompt,
-                  "input_schema": input_schema, "input_timeout_minutes": timeout_minutes},
-        )
+) -> bool:
+    """Tell Switchboard this task is paused waiting for user input.
+    Returns True if Switchboard acknowledged the pause."""
+    if not spend_token:
+        return False
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{SWITCHBOARD_URL}/tasks/{spend_token}/pause",
+                    headers={"Content-Type": "application/json"},
+                    json={"token": spend_token, "input_prompt": input_prompt,
+                          "input_schema": input_schema, "input_timeout_minutes": timeout_minutes},
+                )
+                if r.status_code == 200:
+                    print(f"[PAUSE] ✅ Switchboard acknowledged: {r.json().get('status')}")
+                    return True
+                print(f"[PAUSE] attempt {attempt+1} failed: {r.status_code} {r.text[:100]}")
+        except Exception as e:
+            print(f"[PAUSE] attempt {attempt+1} error: {e}")
+        await asyncio.sleep(2)
+    print(f"[PAUSE] ⚠️  Could not pause on Switchboard after 3 attempts — continuing with local state")
+    return False
 
 
 async def poll_for_input(spend_token: str, timeout_minutes: int = 30) -> Optional[dict]:
-    """Poll Switchboard until input_data is submitted or timeout."""
+    """Poll Switchboard until input_data is submitted or timeout.
+    Returns input_data dict or None on timeout/cancel."""
     if not spend_token:
         return None
     deadline = datetime.utcnow() + timedelta(minutes=timeout_minutes)
     async with httpx.AsyncClient(timeout=10) as client:
         while datetime.utcnow() < deadline:
-            r = await client.get(f"{SWITCHBOARD_URL}/tasks/{spend_token}")
-            if r.status_code == 200:
-                d = r.json()
-                if d.get("status") == "active" and d.get("input_data"):
-                    return d["input_data"]
-                if d.get("status") in ("expired", "failed"):
-                    return None
+            try:
+                r = await client.get(f"{SWITCHBOARD_URL}/tasks/{spend_token}")
+                if r.status_code == 200:
+                    d = r.json()
+                    # Accept input_data regardless of exact status transition
+                    if d.get("input_data"):
+                        print(f"[POLL] ✅ Got input: {d['input_data']}")
+                        return d["input_data"]
+                    if d.get("status") in ("expired", "failed", "completed"):
+                        return None
+            except Exception as e:
+                print(f"[POLL] error: {e}")
             await asyncio.sleep(3)
+    print(f"[POLL] ⏰ Timed out after {timeout_minutes} min")
     return None
 
 
