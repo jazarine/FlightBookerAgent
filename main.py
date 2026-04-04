@@ -14,7 +14,7 @@ import os
 import json
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -357,15 +357,50 @@ async def report_to_switchboard(spend_token: str, actual_spend: float, result: s
         print(f"[SWITCHBOARD] Reported: {r.status_code} actual_spend=${actual_spend:.2f}")
 
 
+async def pause_for_input(
+    spend_token: str,
+    input_prompt: str,
+    input_schema: dict,
+    timeout_minutes: int = 30,
+) -> None:
+    """Tell Switchboard this task is paused waiting for user input."""
+    if not spend_token or not AGENT_API_KEY:
+        return
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{SWITCHBOARD_URL}/tasks/{spend_token}/pause",
+            headers={"Authorization": f"Bearer {AGENT_API_KEY}", "Content-Type": "application/json"},
+            json={"token": spend_token, "input_prompt": input_prompt,
+                  "input_schema": input_schema, "input_timeout_minutes": timeout_minutes},
+        )
+
+
+async def poll_for_input(spend_token: str, timeout_minutes: int = 30) -> Optional[dict]:
+    """Poll Switchboard until input_data is submitted or timeout."""
+    if not spend_token:
+        return None
+    deadline = datetime.utcnow() + timedelta(minutes=timeout_minutes)
+    async with httpx.AsyncClient(timeout=10) as client:
+        while datetime.utcnow() < deadline:
+            r = await client.get(f"{SWITCHBOARD_URL}/tasks/{spend_token}")
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("status") == "active" and d.get("input_data"):
+                    return d["input_data"]
+                if d.get("status") in ("expired", "failed"):
+                    return None
+            await asyncio.sleep(3)
+    return None
+
+
 async def run_flight_booking(task_id: str, description: str, spend_token: Optional[str]):
-    """Main booking flow — runs in background."""
+    """Main booking flow with human-in-the-loop seat selection + confirmation."""
     print(f"[TASK {task_id[:8]}] Starting: {description}")
 
     try:
         params = parse_flight_request(description)
         print(f"[TASK {task_id[:8]}] Parsed: {params}")
 
-        # Default passenger profile (replace with user profile lookup later)
         passenger = {
             "title": "mr", "gender": "m",
             "given_name": "Jaz", "family_name": "Jamal",
@@ -374,32 +409,18 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
             "phone_number": "+14155550001",
         }
 
-        # Search flights (passenger attached to offer request)
+        # ── Step 1: Search ─────────────────────────────────────────────────
         offers, passenger_id = await search_flights(
             params["origin"], params["destination"], params["date"], passenger
         )
-
         if not offers:
             tasks[task_id]["status"] = {"state": "failed"}
             tasks[task_id]["result"] = "No flights found for this route/date."
             await report_to_switchboard(spend_token, 0, "No flights found")
             return
 
-        # In sandbox: prefer Duffel Airways (only test airline that supports booking)
-        # In live mode: pick cheapest within budget
         duffel_offers = [o for o in offers if "duffel" in o["owner"]["name"].lower()]
-        cheapest = None
-        if duffel_offers:
-            cheapest = duffel_offers[0]  # Duffel Airways in sandbox
-        else:
-            for offer in offers:
-                price = float(offer["total_amount"])
-                if price <= params["budget"]:
-                    cheapest = offer
-                    break
-
-        if not cheapest:
-            cheapest = offers[0]  # take cheapest even if over budget
+        cheapest = duffel_offers[0] if duffel_offers else offers[0]
 
         price = float(cheapest["total_amount"])
         airline = cheapest["owner"]["name"]
@@ -408,43 +429,128 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         arrival = slices[0]["segments"][-1]["arriving_at"]
         flight_num = slices[0]["segments"][0]["operating_carrier_flight_number"]
 
-        # Seat selection
-        seat_preference = parse_seat_preference(description)
+        # ── Step 2: Seat selection ─────────────────────────────────────────
         available_seats = await fetch_seat_map(cheapest["id"])
-        chosen_seat = pick_seat(available_seats, seat_preference)
-        seat_service_id = chosen_seat["service_id"] if chosen_seat else None
-        seat_designator = chosen_seat["designator"] if chosen_seat else None
-        seat_price = float(chosen_seat["price"]) if chosen_seat else 0.0
-        print(f"[TASK {task_id[:8]}] Seat preference={seat_preference} chosen={seat_designator} price=+${seat_price}")
 
-        # Update total with seat fee
-        total_amount = str(round(price + seat_price, 2))
+        # Group seats for display
+        window_seats  = [s for s in available_seats if s["designator"] and s["designator"][-1] in ("A","F","K")][:3]
+        aisle_seats   = [s for s in available_seats if s["designator"] and s["designator"][-1] in ("C","D","G","H")][:3]
+        middle_seats  = [s for s in available_seats if s["designator"] and s["designator"][-1] in ("B","E")][:3]
 
-        # Book the flight (sandbox — no real charge)
+        def seat_list(seats):
+            return ", ".join(f"{s['designator']} (${float(s['price']):.0f})" for s in seats) or "none available"
+
+        seat_prompt = (
+            f"Found {airline} flight {flight_num}: {params['origin']} → {params['destination']}\n"
+            f"Departure: {departure} | Arrival: {arrival} | Fare: ${price:.2f}\n\n"
+            f"Available seats:\n"
+            f"  Window:  {seat_list(window_seats)}\n"
+            f"  Aisle:   {seat_list(aisle_seats)}\n"
+            f"  Middle:  {seat_list(middle_seats)}\n\n"
+            f"Reply with your seat number (e.g. '28A') or 'any' to skip seat selection."
+        )
+
+        tasks[task_id]["status"] = {"state": "awaiting_input"}
+        tasks[task_id]["input_prompt"] = seat_prompt
+
+        # Pause task on Switchboard for seat input
+        seat_service_id = None
+        seat_designator = None
+        seat_price = 0.0
+
+        if spend_token:
+            await pause_for_input(
+                spend_token,
+                input_prompt=seat_prompt,
+                input_schema={"type": "object", "properties": {"seat": {"type": "string"}}, "required": ["seat"]},
+            )
+            print(f"[TASK {task_id[:8]}] Waiting for seat input...")
+            seat_input = await poll_for_input(spend_token, timeout_minutes=30)
+
+            if seat_input and seat_input.get("seat", "any").lower() != "any":
+                requested = seat_input["seat"].upper().strip()
+                matched = next((s for s in available_seats if s["designator"] == requested), None)
+                if matched:
+                    seat_service_id = matched["service_id"]
+                    seat_designator = matched["designator"]
+                    seat_price = float(matched["price"])
+                else:
+                    # Seat not available — fall back to auto pick
+                    pref = parse_seat_preference(requested)
+                    chosen = pick_seat(available_seats, pref)
+                    if chosen:
+                        seat_service_id = chosen["service_id"]
+                        seat_designator = chosen["designator"]
+                        seat_price = float(chosen["price"])
+        else:
+            # No spend token (direct /task call) — auto pick based on description
+            pref = parse_seat_preference(description)
+            chosen = pick_seat(available_seats, pref)
+            if chosen:
+                seat_service_id = chosen["service_id"]
+                seat_designator = chosen["designator"]
+                seat_price = float(chosen["price"])
+
+        total_amount = round(price + seat_price, 2)
+        seat_line = f"{seat_designator} (+${seat_price:.2f})" if seat_designator else "not assigned"
+
+        # ── Step 3: Confirmation ───────────────────────────────────────────
+        confirm_prompt = (
+            f"Please confirm your booking:\n\n"
+            f"  ✈️  {airline} {flight_num}\n"
+            f"  {params['origin']} → {params['destination']}\n"
+            f"  Departure: {departure}\n"
+            f"  Arrival:   {arrival}\n"
+            f"  Seat:      {seat_line}\n"
+            f"  Total:     ${total_amount:.2f}\n\n"
+            f"Reply 'yes' to confirm or 'no' to cancel."
+        )
+
+        tasks[task_id]["status"] = {"state": "awaiting_confirmation"}
+        tasks[task_id]["confirm_prompt"] = confirm_prompt
+
+        confirmed = True  # default for direct /task calls without spend_token
+        if spend_token:
+            await pause_for_input(
+                spend_token,
+                input_prompt=confirm_prompt,
+                input_schema={"type": "object", "properties": {"confirmed": {"type": "boolean"}}, "required": ["confirmed"]},
+                timeout_minutes=15,
+            )
+            print(f"[TASK {task_id[:8]}] Waiting for confirmation...")
+            confirm_input = await poll_for_input(spend_token, timeout_minutes=15)
+            confirmed = bool(confirm_input and confirm_input.get("confirmed", False))
+
+        if not confirmed:
+            tasks[task_id]["status"] = {"state": "cancelled"}
+            tasks[task_id]["result"] = "Booking cancelled by user."
+            await report_to_switchboard(spend_token, 0, "Cancelled by user")
+            return
+
+        # ── Step 4: Book ───────────────────────────────────────────────────
+        print(f"[TASK {task_id[:8]}] Confirmed — booking seat={seat_designator} total=${total_amount}")
         order = await book_flight(
             cheapest["id"], passenger_id, passenger,
-            offer_amount=total_amount,
+            offer_amount=str(total_amount),
             offer_currency=cheapest["total_currency"],
             seat_service_id=seat_service_id,
         )
         booking_ref = order.get("booking_reference", "DEMO01")
 
-        seat_line = f"   Seat: {seat_designator} (+${seat_price:.2f})" if seat_designator else "   Seat: not assigned"
         result_text = (
             f"✅ Booked: {airline} flight {flight_num}\n"
             f"   {params['origin']} → {params['destination']}\n"
             f"   Departure: {departure}\n"
-            f"   Arrival: {arrival}\n"
-            f"   Fare: ${price:.2f}\n"
-            f"{seat_line}\n"
-            f"   Total: ${float(total_amount):.2f}\n"
-            f"   Booking ref: {booking_ref}"
+            f"   Arrival:   {arrival}\n"
+            f"   Seat:      {seat_line}\n"
+            f"   Total:     ${total_amount:.2f}\n"
+            f"   Ref:       {booking_ref}"
         )
 
         tasks[task_id].update({
             "status": {"state": "completed"},
             "result": result_text,
-            "actual_spend": float(total_amount),
+            "actual_spend": total_amount,
             "seat": seat_designator,
             "seat_price": seat_price,
             "booking_reference": booking_ref,
@@ -455,13 +561,12 @@ async def run_flight_booking(task_id: str, description: str, spend_token: Option
         })
 
         print(f"[TASK {task_id[:8]}] {result_text}")
-
-        # Report back to Switchboard
-        await report_to_switchboard(spend_token, price, result_text)
+        await report_to_switchboard(spend_token, total_amount, result_text)
 
     except Exception as e:
+        import traceback
         error = f"Booking failed: {e}"
-        print(f"[TASK {task_id[:8]}] ERROR: {e}")
+        print(f"[TASK {task_id[:8]}] ERROR: {traceback.format_exc()}")
         tasks[task_id]["status"] = {"state": "failed"}
         tasks[task_id]["result"] = error
         await report_to_switchboard(spend_token, 0, error)
